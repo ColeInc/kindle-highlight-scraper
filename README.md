@@ -4,8 +4,8 @@ this script automates the extraction of highlighted text (red or blue highlights
 
 ## overall script flow:
 
-- it simulates keyboard presses (right arrow) to flip through pages of a digital book.
-- after each flip, it takes a screenshot of the page and saves it.
+- simulates keyboard presses (right arrow) to flip through pages of a digital book.
+- after each flip, takes a screenshot of the page and saves it.
 - each saved screenshot is processed individually.
 - during processing, the script uses image processing (opencv) to detect red or blue highlights.
 - text within highlighted areas is extracted using optical character recognition (OCR) with tesseract.
@@ -21,10 +21,8 @@ this script automates the extraction of highlighted text (red or blue highlights
 
 to ensure accurate text extraction:
 
-- highlight important text clearly using red or blue colors only.
 - highlight chapter titles to ensure they're correctly identified. a heading is detected if it starts with the word "chapter" or is fully uppercase.
-- avoid overlapping or unclear highlights; maintain slight gaps between separate highlights to ensure proper text separation in the output.
-- screenshots should clearly show highlighted text without obstruction (e.g., avoid cursor placement or pop-ups).
+- highlight important text clearly using red or blue colors only (you need to tell the OCR the color codes of each highlight color you add).
 
 following this setup will yield structured and easily readable output from the script.
 
