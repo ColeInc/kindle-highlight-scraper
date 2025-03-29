@@ -100,8 +100,10 @@ def process_single_screenshot(screenshot_path, highlights):
 
     # Define HSV color ranges for highlights (adjust as necessary)
     blue_lower, blue_upper = np.array([85, 50, 150]), np.array([115, 150, 255])
-    red_lower1, red_upper1 = np.array([0, 150, 0]), np.array([10, 255, 255])
-    red_lower2, red_upper2 = np.array([160, 150, 0]), np.array([179, 255, 255])
+    red_lower1, red_upper1 = np.array([0, 20, 200]), np.array(
+        [10, 80, 255])  # Adjusted for lighter pink
+    red_lower2, red_upper2 = np.array([160, 20, 200]), np.array(
+        [179, 80, 255])  # Adjusted for lighter pink
 
     # Masks
     blue_mask = detect_highlights(image, blue_lower, blue_upper)
