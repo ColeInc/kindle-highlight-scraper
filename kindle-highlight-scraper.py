@@ -1,5 +1,4 @@
 import cv2
-import pytesseract
 import pyautogui
 import os
 import json
@@ -8,214 +7,271 @@ from PIL import Image
 import numpy as np
 import time
 import matplotlib.pyplot as plt
+import google.generativeai as genai
+from dotenv import load_dotenv
+import base64
+import logging
+from typing import Dict, List, Any
 
-# Configure pytesseract (path to Tesseract executable may vary)
-if os.name == 'nt':  # Windows
-    # Adjust path as needed
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-else:  # macOS/Linux
-    # For macOS with Homebrew
-    pytesseract.pytesseract.tesseract_cmd = r'/opt/homebrew/bin/tesseract'
-    # or '/usr/bin/tesseract' for Linux
+# Setup logging with detailed formatting FIRST
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('kindle_scraper.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+logger.info("Starting Kindle Highlight Scraper...")
+logger.info("Loading environment variables from .env file")
+load_dotenv()
+
+# Configure Gemini API
+logger.info("Configuring Gemini API connection")
+api_key = os.getenv('GEMINI_API_KEY')
+if not api_key:
+    logger.error("GEMINI_API_KEY not found in environment variables")
+    raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+
+logger.info("Gemini API key loaded successfully")
+genai.configure(api_key=api_key)
+logger.info("Gemini API configured successfully")
 
 # Directories
 SCREENSHOT_DIR = "screenshots"
 OUTPUT_DIR = "extracted_highlights"
 DEBUG_DIR = "debug_images"  # For saving debug images
 
+logger.info(f"Setting up directories: {SCREENSHOT_DIR}, {OUTPUT_DIR}, {DEBUG_DIR}")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)  # Create debug directory
+logger.info("All directories created successfully")
 
 # ------------------- Extraction Phase -------------------
 
 
 def extract_next_page():
     """Simulates pressing the right-arrow key."""
+    logger.debug("Simulating right arrow key press for next page")
     pyautogui.press('right')
     time.sleep(0.5)  # wait for page change
+    logger.debug("Page turn completed")
 
 
 def extract_screenshot(page_num):
     """Captures and saves a screenshot."""
+    logger.info(f"Capturing screenshot for page {page_num}")
     timestamp = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     screenshot_path = os.path.join(
         SCREENSHOT_DIR, f"screenshot_{timestamp}_page{page_num}.png")
+    logger.debug(f"Screenshot will be saved to: {screenshot_path}")
     screenshot = pyautogui.screenshot()
     screenshot.save(screenshot_path)
+    logger.info(f"Screenshot saved successfully: {screenshot_path}")
     return screenshot_path
 
 
 def extraction_orchestrater(pages_to_capture=5):
     """Main extraction orchestrator."""
+    logger.info(f"Starting screenshot extraction for {pages_to_capture} pages")
     paths = []
 
     # Add a timeout before starting the extraction process
+    logger.info("Waiting 2 seconds before starting extraction process...")
     print("Waiting 2 seconds before starting extraction...")
     time.sleep(2)
+    
     for page_num in range(1, pages_to_capture + 1):
+        logger.info(f"Processing page {page_num} of {pages_to_capture}")
         extract_next_page()
         screenshot_path = extract_screenshot(page_num)
         paths.append(screenshot_path)
+        logger.info(f"Successfully captured page {page_num}: {screenshot_path}")
         print(f"Captured screenshot: {screenshot_path}")
+    
+    logger.info(f"Screenshot extraction completed. Total pages captured: {len(paths)}")
     return paths
 
 # ------------------- Processing Phase -------------------
 
+# Define the schema for Gemini API response
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "extracted_text": {
+            "type": "string",
+            "description": "Complete text content from the image"
+        },
+        "columns_detected": {
+            "type": "integer",
+            "description": "Number of columns detected in the layout (1 or 2)"
+        },
+        "blue_highlights": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Array of complete blue highlighted text segments, with multi-line highlights grouped together"
+        },
+        "red_highlights": {
+            "type": "array", 
+            "items": {"type": "string"},
+            "description": "Array of complete red/pink highlighted text segments, with multi-line highlights grouped together"
+        }
+    },
+    "required": ["extracted_text", "columns_detected", "blue_highlights", "red_highlights"]
+}
 
-def detect_highlights(image, color_lower, color_upper):
-    """Detects highlighted areas based on color range."""
-    hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv_img, color_lower, color_upper)
-    return mask
+
+def extract_text_with_gemini(image_path: str) -> Dict[str, Any]:
+    """
+    Extract text and highlights from an image using Gemini 2.5 Flash API.
+    
+    Args:
+        image_path: Path to the image file to process
+        
+    Returns:
+        Dictionary containing extracted text, blue highlights, and red highlights
+    """
+    try:
+        logger.info(f"🔍 Starting Gemini analysis for image: {os.path.basename(image_path)}")
+        
+        # Validate image file exists
+        if not os.path.exists(image_path):
+            logger.error(f"Image file not found: {image_path}")
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+        # Check file size
+        file_size = os.path.getsize(image_path) / (1024 * 1024)  # MB
+        logger.debug(f"Image file size: {file_size:.2f} MB")
+        
+        # Load and prepare the image
+        logger.debug("Loading image file...")
+        with open(image_path, 'rb') as image_file:
+            image_data = image_file.read()
+        
+        # Convert image to PIL format for Gemini
+        logger.debug("Converting image to PIL format...")
+        pil_image = Image.open(image_path)
+        logger.debug(f"Image dimensions: {pil_image.size[0]}x{pil_image.size[1]} pixels")
+        
+        # Initialize Gemini model
+        logger.info("🤖 Initializing Gemini 2.0 Flash model...")
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        
+        # Create the prompt
+        logger.debug("Preparing AI prompt for highlight detection...")
+        prompt = """
+        Analyze this book/document page image and extract highlighted text with proper grouping and ordering.
+
+        CRITICAL INSTRUCTIONS:
+
+        1. COLUMN DETECTION:
+           - Determine if this is a single-column or two-column layout
+           - Set "columns_detected" to 1 or 2 accordingly
+
+        2. HIGHLIGHT GROUPING:
+           - Group consecutive highlighted lines into single entries
+           - If a highlight spans multiple lines, combine them into ONE complete text segment
+           - Do NOT split multi-line highlights into separate array items
+           - Example: If 3 consecutive lines are highlighted blue, return as 1 blue highlight entry
+
+        3. READING ORDER (VERY IMPORTANT):
+           - For single-column: Order highlights from top to bottom as they appear
+           - For two-column: Read LEFT column completely from top to bottom, THEN right column top to bottom
+           - The arrays should reflect the exact reading order someone would follow when reading the page
+           - Maintain chronological order as if reading the document naturally
+
+        4. TEXT PROCESSING:
+           - Join multi-line highlights with spaces, preserving sentence structure
+           - Remove excessive whitespace but maintain readability
+           - Keep punctuation and capitalization intact
+
+        5. COLOR DETECTION:
+           - Blue highlights: Any blue, cyan, or blue-tinted highlighting
+           - Red highlights: Any red, pink, magenta, or red-tinted highlighting
+           - Be generous in color detection - include lighter shades
+
+        Return JSON with:
+        - extracted_text: Complete page text
+        - columns_detected: 1 or 2
+        - blue_highlights: Array of complete blue highlight segments in reading order
+        - red_highlights: Array of complete red highlight segments in reading order
+
+        If no highlights found in a color, return empty array for that field.
+        """
+        
+        # Generate content with schema
+        logger.info("📤 Sending image to Gemini API for analysis...")
+        response = model.generate_content(
+            [prompt, pil_image],
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=GEMINI_RESPONSE_SCHEMA
+            )
+        )
+        
+        logger.info("📥 Received response from Gemini API")
+        logger.debug(f"Response length: {len(response.text)} characters")
+        
+        # Parse the response
+        logger.debug("Parsing JSON response...")
+        result = json.loads(response.text)
+        
+        # Log detailed results
+        blue_count = len(result.get('blue_highlights', []))
+        red_count = len(result.get('red_highlights', []))
+        text_length = len(result.get('extracted_text', ''))
+        columns_detected = result.get('columns_detected', 'unknown')
+        
+        logger.info(f"✅ Gemini analysis completed successfully:")
+        logger.info(f"   📄 Columns detected: {columns_detected}")
+        logger.info(f"   📘 Blue highlights found: {blue_count}")
+        logger.info(f"   📕 Red highlights found: {red_count}")
+        logger.info(f"   📄 Total text extracted: {text_length} characters")
+        
+        if blue_count > 0:
+            for i, highlight in enumerate(result.get('blue_highlights', [])[:3], 1):  # Show first 3
+                logger.debug(f"   Blue highlight {i}: {highlight[:100]}{'...' if len(highlight) > 100 else ''}")
+        
+        if red_count > 0:
+            for i, highlight in enumerate(result.get('red_highlights', [])[:3], 1):  # Show first 3
+                logger.debug(f"   Red highlight {i}: {highlight[:100]}{'...' if len(highlight) > 100 else ''}")
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Failed to parse Gemini response as JSON: {str(e)}")
+        logger.debug(f"Raw response: {response.text if 'response' in locals() else 'No response received'}")
+        return {
+            "extracted_text": "",
+            "blue_highlights": [],
+            "red_highlights": []
+        }
+    except Exception as e:
+        logger.error(f"❌ Error processing image with Gemini: {str(e)}")
+        logger.debug(f"Exception type: {type(e).__name__}")
+        # Return empty result on error
+        return {
+            "extracted_text": "",
+            "blue_highlights": [],
+            "red_highlights": []
+        }
 
 
-def detect_columns(image):
-    """Detect columns in a book page using improved algorithm."""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def is_chapter_title(text):
+    """Heuristic to detect chapter titles."""
+    return text.lower().startswith("chapter") or text.isupper()
 
-    # Apply threshold to get text regions
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-    # Apply morphology to connect text within columns
-    kernel = np.ones((5, 50), np.uint8)  # Horizontal kernel
-    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+# Legacy OCR functions removed - now using Gemini API for text extraction
 
-    # Sum pixel values along vertical axis to get horizontal profile
-    h_profile = np.sum(morph, axis=0)
 
-    # Normalize and smooth the profile
-    if np.max(h_profile) > 0:
-        h_profile = h_profile / np.max(h_profile)
-    h_profile_smooth = np.convolve(h_profile, np.ones(100)/100, mode='same')
-
-    # Save horizontal profile for debugging
-    plt_h = np.zeros((300, len(h_profile_smooth)), dtype=np.uint8)
-    for i in range(len(h_profile_smooth)):
-        cv2.line(plt_h, (i, 300), (i, 300 -
-                 int(h_profile_smooth[i] * 300)), 255, 1)
-
-    timestamp = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    profile_path = os.path.join(DEBUG_DIR, f"h_profile_{timestamp}.png")
-    cv2.imwrite(profile_path, plt_h)
-
-    # Find valleys (potential column separators)
-    width = image.shape[1]
-
-    # Use adaptive threshold to find valleys
-    # Calculate mean and standard deviation, and use them to set threshold
-    non_zero_profile = h_profile_smooth[h_profile_smooth > 0.05]
-    if len(non_zero_profile) > 0:
-        mean_density = np.mean(non_zero_profile)
-        std_density = np.std(non_zero_profile)
-        # Set threshold below mean (valleys are lower than peaks)
-        valley_threshold = max(0.15, mean_density - 1.5 * std_density)
-    else:
-        # Default threshold if calculation fails
-        valley_threshold = 0.15
-
-    print(f"Valley threshold: {valley_threshold}")
-
-    # Find significant valleys
-    valleys = []
-    in_valley = False
-    valley_start = 0
-    min_val = 1.0
-    min_idx = 0
-
-    # Ignore the edges of the image (10% on each side)
-    edge_margin = int(width * 0.1)
-
-    for i in range(edge_margin, width - edge_margin):
-        if h_profile_smooth[i] < valley_threshold:
-            if not in_valley:
-                valley_start = i
-                min_val = h_profile_smooth[i]
-                min_idx = i
-                in_valley = True
-            elif h_profile_smooth[i] < min_val:
-                min_val = h_profile_smooth[i]
-                min_idx = i
-        else:
-            if in_valley:
-                # Found valley end
-                valley_end = i
-                # Use the lowest point of the valley
-                valleys.append(min_idx)
-                in_valley = False
-
-    # Handle case where last column extends to edge
-    if in_valley:
-        valleys.append(min_idx)
-
-    # Filter out valleys that are too close to each other
-    if len(valleys) > 1:
-        filtered_valleys = [valleys[0]]
-        for i in range(1, len(valleys)):
-            if valleys[i] - filtered_valleys[-1] > width * 0.15:  # Minimum 15% of width apart
-                filtered_valleys.append(valleys[i])
-        valleys = filtered_valleys
-
-    # Based on valleys, determine column boundaries
-    columns = []
-
-    # Check if we actually found any significant valleys
-    if len(valleys) == 0:
-        # Single column
-        columns.append((0, width))
-    else:
-        # First column starts at 0
-        columns.append((0, valleys[0]))
-
-        # Middle columns
-        for i in range(len(valleys)-1):
-            columns.append((valleys[i], valleys[i+1]))
-
-        # Last column ends at page width
-        columns.append((valleys[-1], width))
-
-    # Apply minimum width filter (at least 10% of page width)
-    min_col_width = width // 10
-    filtered_columns = []
-    for col_start, col_end in columns:
-        if col_end - col_start >= min_col_width:
-            filtered_columns.append((col_start, col_end))
-
-    # If all columns were filtered out, fall back to single column
-    if not filtered_columns:
-        filtered_columns = [(0, width)]
-
-    # Save debug image with column boundaries
-    debug_img = image.copy()
-    for idx, (col_start, col_end) in enumerate(filtered_columns):
-        # Green line for start, red line for end
-        cv2.line(debug_img, (col_start, 0),
-                 (col_start, image.shape[0]), (0, 255, 0), 2)
-        cv2.line(debug_img, (col_end, 0),
-                 (col_end, image.shape[0]), (0, 0, 255), 2)
-
-        # Add column number label
-        cv2.putText(debug_img, f"Col {idx+1}", (col_start + 20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-
-    # Draw threshold line on profile plot for debugging
-    threshold_img = plt_h.copy()
-    threshold_y = 300 - int(valley_threshold * 300)
-    cv2.line(threshold_img, (0, threshold_y), (width, threshold_y), 128, 2)
-    cv2.imwrite(os.path.join(
-        DEBUG_DIR, f"threshold_{timestamp}.png"), threshold_img)
-
-    # Save final debug image
-    debug_path = os.path.join(DEBUG_DIR, f"columns_{timestamp}.png")
-    cv2.imwrite(debug_path, debug_img)
-
-    print(f"Detected {len(filtered_columns)} columns in the image")
-    for i, (start, end) in enumerate(filtered_columns):
-        print(f"  Column {i+1}: {start}-{end} (width: {end-start}px)")
-
-    return filtered_columns
-
+# ------------------- Legacy Functions (deprecated) -------------------
+# The following functions are no longer used with Gemini API integration
+# but are kept for reference. They can be removed in future cleanup.
 
 def extract_full_column_text(image, col_start, col_end):
     """Extract all text from a column, regardless of highlighting."""
@@ -464,125 +520,212 @@ def process_highlighted_column(image, highlight_mask, col_start, col_end, color)
     return highlights
 
 
-def is_chapter_title(text):
-    """Heuristic to detect chapter titles."""
-    return text.lower().startswith("chapter") or text.isupper()
-
-
 def process_single_screenshot(screenshot_path, highlights):
-    """Processes a single screenshot to extract highlighted text."""
-    image = cv2.imread(screenshot_path)
-    if image is None:
-        print(f"Error: Could not read image at {screenshot_path}")
+    """Processes a single screenshot to extract highlighted text using Gemini API."""
+    logger.info(f"🖼️  Processing screenshot: {os.path.basename(screenshot_path)}")
+    
+    if not os.path.exists(screenshot_path):
+        logger.error(f"❌ Screenshot not found: {screenshot_path}")
         return
 
-    # Save original image for reference
-    timestamp = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"original_{timestamp}.png"), image)
-
-    # Define HSV color ranges for highlights (adjust as necessary)
-    blue_lower, blue_upper = np.array([85, 50, 150]), np.array([115, 150, 255])
-    red_lower1, red_upper1 = np.array([0, 20, 200]), np.array(
-        [10, 80, 255])  # Adjusted for lighter pink
-    red_lower2, red_upper2 = np.array([160, 20, 200]), np.array(
-        [179, 80, 255])  # Adjusted for lighter pink
-
-    # Create masks
-    blue_mask = detect_highlights(image, blue_lower, blue_upper)
-    red_mask1 = detect_highlights(image, red_lower1, red_upper1)
-    red_mask2 = detect_highlights(image, red_lower2, red_upper2)
-    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-
-    # Save debug images of masks
-    cv2.imwrite(os.path.join(
-        DEBUG_DIR, f"blue_mask_{timestamp}.png"), blue_mask)
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"red_mask_{timestamp}.png"), red_mask)
-
-    # Detect columns in the image
-    columns = detect_columns(image)
-
-    # Fall back to single column if detection failed
-    if not columns:
-        width = image.shape[1]
-        columns = [(0, width)]
-        print("Column detection failed, falling back to single column")
-
     try:
-        # Process each column
-        all_blue_highlights = []
-        all_red_highlights = []
+        logger.debug(f"Screenshot file path: {screenshot_path}")
+        
+        # Extract text and highlights using Gemini
+        logger.info("⚡ Calling Gemini API for text extraction...")
+        gemini_result = extract_text_with_gemini(screenshot_path)
+        
+        blue_highlights = gemini_result.get('blue_highlights', [])
+        red_highlights = gemini_result.get('red_highlights', [])
+        
+        logger.info(f"📊 Processing results from Gemini:")
+        logger.info(f"   Blue highlights to process: {len(blue_highlights)}")
+        logger.info(f"   Red highlights to process: {len(red_highlights)}")
+        
+        processed_blue = 0
+        processed_red = 0
+        
+        # Process blue highlights
+        logger.debug("Processing blue highlights...")
+        for i, highlight_text in enumerate(blue_highlights, 1):
+            if highlight_text.strip():
+                is_heading = is_chapter_title(highlight_text)
+                highlight = {
+                    "text": highlight_text.strip(),
+                    "color": "blue",
+                    "heading": is_heading
+                }
+                highlights.append(highlight)
+                processed_blue += 1
+                logger.debug(f"   Blue #{i}: {'[HEADING] ' if is_heading else ''}{highlight_text[:50]}{'...' if len(highlight_text) > 50 else ''}")
 
-        for col_start, col_end in columns:
-            # Process blue highlights
-            blue_highlights = process_highlighted_column(
-                image, blue_mask, col_start, col_end, "blue")
-            all_blue_highlights.extend(blue_highlights)
+        # Process red highlights
+        logger.debug("Processing red highlights...")
+        for i, highlight_text in enumerate(red_highlights, 1):
+            if highlight_text.strip():
+                is_heading = is_chapter_title(highlight_text)
+                highlight = {
+                    "text": highlight_text.strip(),
+                    "color": "red", 
+                    "heading": is_heading
+                }
+                highlights.append(highlight)
+                processed_red += 1
+                logger.debug(f"   Red #{i}: {'[HEADING] ' if is_heading else ''}{highlight_text[:50]}{'...' if len(highlight_text) > 50 else ''}")
 
-            # Process red highlights
-            red_highlights = process_highlighted_column(
-                image, red_mask, col_start, col_end, "red")
-            all_red_highlights.extend(red_highlights)
-
-        # Print results
-        print(f"Found {len(all_blue_highlights)} blue highlighted texts")
-        print(f"Found {len(all_red_highlights)} red highlighted texts")
-
-        for i, h in enumerate(all_blue_highlights):
-            print(f"Blue highlight {i+1}: {h['text']}")
-            highlights.append(h)
-
-        for i, h in enumerate(all_red_highlights):
-            print(f"Red highlight {i+1}: {h['text']}")
-            highlights.append(h)
+        logger.info(f"✅ Screenshot processing completed:")
+        logger.info(f"   📘 Blue highlights processed: {processed_blue}")
+        logger.info(f"   📕 Red highlights processed: {processed_red}")
+        logger.info(f"   📚 Total highlights added: {processed_blue + processed_red}")
+        
+        print(f"Found {len(blue_highlights)} blue highlighted texts")
+        print(f"Found {len(red_highlights)} red highlighted texts")
 
     except Exception as e:
+        logger.error(f"❌ Error processing screenshot {os.path.basename(screenshot_path)}: {str(e)}")
+        logger.debug(f"Full error details: {type(e).__name__}: {str(e)}")
         print(f"Error processing highlights in {screenshot_path}: {str(e)}")
-        import traceback
-        traceback.print_exc()
 
 
 def screenshot_data_orchestrator():
     """Main orchestrator for processing screenshots."""
+    logger.info("🚀 Starting screenshot processing orchestrator")
+    
     timestamp = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     highlights = []  # Single list for all highlights
+    
+    logger.info(f"📅 Session timestamp: {timestamp}")
+    logger.info(f"📁 Screenshot directory: {SCREENSHOT_DIR}")
+    logger.info(f"💾 Output directory: {OUTPUT_DIR}")
 
-    # Process a specific file first
-    specific_file = os.path.join(
-        SCREENSHOT_DIR, "screenshot_2025.03.29_15.52.37_page2.png")
+    # Check if screenshot directory exists and has files
+    if not os.path.exists(SCREENSHOT_DIR):
+        logger.error(f"❌ Screenshot directory does not exist: {SCREENSHOT_DIR}")
+        print(f"Error: Screenshot directory not found: {SCREENSHOT_DIR}")
+        return
+    
+    # Get all screenshot files
+    logger.info("📂 Scanning for screenshot files...")
+    all_files = os.listdir(SCREENSHOT_DIR)
+    screenshot_files = [f for f in all_files if f.endswith('.png')]
+    
+    logger.info(f"📊 Found {len(screenshot_files)} PNG files in screenshot directory")
+    if len(screenshot_files) == 0:
+        logger.warning("⚠️  No PNG files found in screenshot directory")
+        print("Warning: No screenshot files found to process")
+        return
+
+    # Process a specific file first (if it exists)
+    specific_file = os.path.join(SCREENSHOT_DIR, "screenshot_2025.03.29_15.52.37_page2.png")
     if os.path.exists(specific_file):
+        logger.info(f"🎯 Processing specific test file: {os.path.basename(specific_file)}")
         print(f"Processing specific file: {specific_file}")
         process_single_screenshot(specific_file, highlights)
+        logger.info(f"✅ Specific file processing completed. Current highlights: {len(highlights)}")
+    else:
+        logger.info("ℹ️  Specific test file not found, will process all files")
 
-    # UNCOMMENT DIS STUFF:
     # Get all screenshot files from the directory and sort by creation time
-    # screenshot_paths = [os.path.join(SCREENSHOT_DIR, f) for f in os.listdir(
-    #     SCREENSHOT_DIR) if f.endswith('.png')]
-    # # Sort by creation time
-    # screenshot_paths.sort(key=lambda x: os.path.getctime(x))
+    logger.info("📋 Preparing to process all screenshot files...")
+    screenshot_paths = [os.path.join(SCREENSHOT_DIR, f) for f in screenshot_files]
+    
+    # Sort by creation time
+    logger.debug("🔄 Sorting files by creation time...")
+    screenshot_paths.sort(key=lambda x: os.path.getctime(x))
+    
+    logger.info(f"📑 Will process {len(screenshot_paths)} files in chronological order:")
+    for i, path in enumerate(screenshot_paths, 1):
+        logger.debug(f"   {i}. {os.path.basename(path)}")
 
     # Process all screenshots
-    # for screenshot in screenshot_paths:
-    #     print(f"Processing {screenshot}")
-    #     process_single_screenshot(screenshot, highlights)
+    logger.info("🔄 Starting batch processing of all screenshots...")
+    for i, screenshot in enumerate(screenshot_paths, 1):
+        logger.info(f"📄 Processing file {i}/{len(screenshot_paths)}: {os.path.basename(screenshot)}")
+        print(f"Processing {screenshot}")
+        
+        initial_count = len(highlights)
+        process_single_screenshot(screenshot, highlights)
+        new_highlights = len(highlights) - initial_count
+        
+        logger.info(f"   ✅ File {i} completed. New highlights: {new_highlights}, Total: {len(highlights)}")
+        print(f"   Added {new_highlights} highlights. Total: {len(highlights)}")
 
     # Save to JSON with updated timestamp format
+    logger.info("💾 Saving results to JSON file...")
     output_path = os.path.join(OUTPUT_DIR, f"highlights_{timestamp}.json")
-    with open(output_path, "w") as f:
-        json.dump(highlights, f, indent=2)
-
-    print(f"Highlights saved to {output_path}")
-    print(f"Extracted {len(highlights)} highlights")
+    
+    logger.debug(f"Output file path: {output_path}")
+    logger.debug(f"Total highlights to save: {len(highlights)}")
+    
+    try:
+        with open(output_path, "w", encoding='utf-8') as f:
+            json.dump(highlights, f, indent=2, ensure_ascii=False)
+        
+        file_size = os.path.getsize(output_path) / 1024  # KB
+        logger.info(f"✅ Successfully saved highlights to: {output_path}")
+        logger.info(f"📊 Final Statistics:")
+        logger.info(f"   📝 Total highlights extracted: {len(highlights)}")
+        logger.info(f"   📁 Output file size: {file_size:.2f} KB")
+        logger.info(f"   📄 Files processed: {len(screenshot_paths)}")
+        
+        # Count highlights by color and headings
+        blue_count = sum(1 for h in highlights if h.get('color') == 'blue')
+        red_count = sum(1 for h in highlights if h.get('color') == 'red')
+        heading_count = sum(1 for h in highlights if h.get('heading', False))
+        
+        logger.info(f"   📘 Blue highlights: {blue_count}")
+        logger.info(f"   📕 Red highlights: {red_count}")
+        logger.info(f"   📚 Chapter headings: {heading_count}")
+        
+        # Log some sample highlights for verification
+        if blue_count > 0:
+            logger.debug("📘 Sample blue highlights:")
+            for i, h in enumerate([h for h in highlights if h.get('color') == 'blue'][:2], 1):
+                text_preview = h.get('text', '')[:80] + ('...' if len(h.get('text', '')) > 80 else '')
+                logger.debug(f"   {i}. {text_preview}")
+        
+        if red_count > 0:
+            logger.debug("📕 Sample red highlights:")
+            for i, h in enumerate([h for h in highlights if h.get('color') == 'red'][:2], 1):
+                text_preview = h.get('text', '')[:80] + ('...' if len(h.get('text', '')) > 80 else '')
+                logger.debug(f"   {i}. {text_preview}")
+        
+        print(f"Highlights saved to {output_path}")
+        print(f"Extracted {len(highlights)} highlights")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to save highlights to file: {str(e)}")
+        print(f"Error saving highlights: {str(e)}")
+        
+    logger.info("🎉 Screenshot processing orchestrator completed!")
 
 
 # ------------------- Main Function -------------------
 
 
-def main(pages_to_capture=5):
-    """Main orchestrator function to trigger all."""
-    # screenshot_paths = extraction_orchestrater(pages_to_capture)
-    screenshot_data_orchestrator()
+def main():
+    """Main orchestrator function to trigger screenshot processing."""
+    logger.info("=" * 80)
+    logger.info("🚀 KINDLE HIGHLIGHT SCRAPER - STARTING APPLICATION")
+    logger.info("=" * 80)
+    
+    try:
+        screenshot_data_orchestrator()
+        logger.info("🎉 Application completed successfully!")
+        
+    except KeyboardInterrupt:
+        logger.warning("⚠️  Application interrupted by user")
+        print("\nApplication interrupted by user")
+        
+    except Exception as e:
+        logger.error(f"❌ Application failed with error: {str(e)}")
+        logger.debug(f"Exception details: {type(e).__name__}: {str(e)}")
+        print(f"Application error: {str(e)}")
+        
+    finally:
+        logger.info("🔚 Application shutdown complete")
+        logger.info("=" * 80)
 
 
 if __name__ == "__main__":
-    # Adjust number of pages as required
-    main(pages_to_capture=5)
+    main()

@@ -178,3 +178,4 @@ cython_debug/
 /extracted_highlights/
 
 /debug_images/
+.claude*
